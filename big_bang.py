@@ -1,3 +1,17 @@
+"""
+big_bang.py - FollowMath server
+
+Helps a blind student copy math from a whiteboard onto an iPad.
+
+Two devices share this server:
+  - the phone (/camera) watches the whiteboard and streams frames
+  - the iPad (/) is where the student draws with a pencil and listens to the tutor
+
+Meta models used:
+  - SAM 3.1          locates the equation (and each symbol) in an image
+  - Muse Spark 1.3   reads the equation, names symbols, and tutors the student
+  - Muse Voice       transcribes spoken questions
+"""
 import os
 import base64
 import json
@@ -20,9 +34,10 @@ from symbol_map import build_symbol_map
 
 load_dotenv()
 META_API_KEY = os.getenv("META_API_KEY")
-META_CHAT_ENDPOINT = "https://api.meta.ai/v1/chat/completions" 
+META_CHAT_ENDPOINT = "https://api.meta.ai/v1/chat/completions"
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")   # set FFMPEG_PATH in .env if ffmpeg is not on PATH
 
-# --- GLOBAL PIPELINE & AUDIO CACHE ---
+# --- Shared state ---
 pipeline_data = {
     "x1": 0, "y1": 0, "x2": 0, "y2": 0,
     "start_x": 0, "start_y": 0,
@@ -30,21 +45,21 @@ pipeline_data = {
     "semantic_text": "",
     "zones": {},
     "raw_stencil_mask": None,
-    "ready": False,   # becomes True once a whiteboard photo has been scanned
+    "ready": False,   # True once an equation has been read from the board
 }
 
-audio_cache = {}
+audio_cache = {}      # text -> base64 mp3
 
-# --- TWO-DEVICE HUB: the phone (camera) and the iPad (drawing + audio) share this one server ---
+# Connection hub: the phone and the iPad talk through the server
 hub = {
-    "ipad_ws": None,    # the iPad's websocket (/ws)
-    "phone_ws": None,   # the phone's websocket (/ws/camera)
-    "inbox": None,      # the iPad session's message queue; the phone drops camera frames into it
-    "live_on": False,   # whether the iPad wants the phone to send live frames
+    "ipad_ws": None,
+    "phone_ws": None,
+    "inbox": None,      # the iPad session's message queue; camera frames from the phone are put here
+    "live_on": False,   # whether the iPad wants live frames from the phone
 }
 
 async def push_phone_live():
-    # Tell the phone whether to keep sending live frames
+    # Tell the phone whether to stream live frames
     phone = hub["phone_ws"]
     if phone is not None:
         try:
@@ -69,16 +84,17 @@ async def notify_phone(obj):
             pass
 
 async def get_fast_voice(text):
+    # Text-to-speech with an in-memory cache. Returns base64 mp3, or None on failure.
     if text in audio_cache:
         return audio_cache[text]
-        
+
     def sync_tts():
         tts = gTTS(text=text, lang='en', slow=False)
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
         return base64.b64encode(fp.read()).decode('utf-8')
-        
+
     try:
         b64_audio = await asyncio.to_thread(sync_tts)
         audio_cache[text] = b64_audio
@@ -87,9 +103,10 @@ async def get_fast_voice(text):
         print(f"TTS failed: {e}")
         return None
 
-# --- 1. META HACKATHON API INTEGRATIONS ---
+# --- 1. Meta API calls ---
 async def call_sam_3_1(image_path: str):
-    print("1. Calling Meta SAM 3.1 for dynamic spatial localization...")
+    # Ask SAM 3.1 for the bounding box of the equation. Returns (x1, y1, x2, y2) or None.
+    print("1. Calling SAM 3.1 to locate the equation...")
     with open(image_path, "rb") as image_file:
         base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
@@ -97,7 +114,7 @@ async def call_sam_3_1(image_path: str):
         "Authorization": f"Bearer {META_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     sam_payload = {
         "model": "sam-3.1",
         "input": [
@@ -111,9 +128,9 @@ async def call_sam_3_1(image_path: str):
             }
         ]
     }
-    
+
     sam_endpoint = "https://api.meta.ai/v1/responses"
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(sam_endpoint, headers=headers, json=sam_payload, timeout=15.0)
@@ -123,97 +140,95 @@ async def call_sam_3_1(image_path: str):
                 box_match = re.search(r"<\|box;x1=(\d+(?:\.\d+)?);y1=(\d+(?:\.\d+)?);x2=(\d+(?:\.\d+)?);y2=(\d+(?:\.\d+)?);", sam_text)
                 if box_match:
                     x1, y1, x2, y2 = (int(float(v)) for v in box_match.groups())
-                    print(f"Dynamic Bounding Box Found: Top-Left({x1}, {y1}) to Bottom-Right({x2}, {y2})")
+                    print(f"Bounding box found: ({x1}, {y1}) to ({x2}, {y2})")
                     return x1, y1, x2, y2
                 print(f"   SAM answered but gave no box. It said: {sam_text[:200]!r}")
             else:
                 print(f"   SAM HTTP {response.status_code}: {response.text[:200]}")
         except Exception as e:
             print(f"SAM 3.1 connection failed: {type(e).__name__}: {e!r}")
-            
-    return None   # caller falls back to the whole photo
+
+    return None   # the caller falls back to the whole photo
 
 async def call_muse_spark(image_path: str, bbox: tuple):
-    print("2. Asking Muse Spark to dynamically chunk the equation...")
+    # Have Muse Spark read the cropped equation and split it into spoken left/center/right thirds.
+    print("2. Asking Muse Spark to read the equation...")
     img = Image.open(image_path)
     cropped_img = img.crop(bbox)
-    
+
     buffered = io.BytesIO()
     cropped_img.save(buffered, format="PNG")
     base64_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
+
     headers = {
         "Authorization": f"Bearer {META_API_KEY}",
         "Content-Type": "application/json"
     }
-    
-    # THE FIX: Force Spark to return a structured JSON breakdown of the equation
+
+    # Structured JSON output so each third of the equation can be spoken on its own
     payload = {
         "model": "muse-spark-1.3",
         "messages": [
             {
-                "role": "system", 
+                "role": "system",
                 "content": "You are a math accessibility assistant helping a blind student. Look at the picture of a written math equation (handwritten or on a whiteboard). Output ONLY a valid JSON object with exactly these 5 keys: 'found' (true only if a written math equation is clearly visible, otherwise false), 'full_audio' (the entire equation spoken in English), 'left_audio' (the spoken English for the left third of the equation), 'center_audio' (the spoken English for the middle third), 'right_audio' (the spoken English for the right third)."
             },
             {
-                "role": "user", 
+                "role": "user",
                 "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}]
             }
         ]
     }
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(META_CHAT_ENDPOINT, headers=headers, json=payload, timeout=15.0)
             if response.status_code == 200:
                 content = response.json()["choices"][0]["message"]["content"]
-                # Strip markdown code blocks if Spark hallucinates them
+                # Remove markdown code fences if the model wraps its JSON in them
                 content = content.replace("```json", "").replace("```", "").strip()
                 return json.loads(content)
         except Exception as e:
             print(f"Spark parsing failed: {e}")
-            
-    # No made-up fallback equation: if Spark fails, the caller asks the user to retake the picture
+
+    # No placeholder equation on failure: the caller asks the user to retake the picture
     return None
 
 async def transcribe_audio(audio_b64: str):
-    print("5. Transcribing user voice question...")
-    
+    # Convert the recorded question to WAV and transcribe it with Muse Voice
+    print("5. Transcribing the student's question...")
+
     if "," in audio_b64:
         audio_b64 = audio_b64.split(",")[1]
-        
+
     audio_data = base64.b64decode(audio_b64)
-    
-    # FRONTEND SAFEGUARD: If the user tapped too fast and sent a 0-byte file
-    if len(audio_data) < 100: 
-        print("Audio payload was empty (user tapped too fast).")
+
+    # Ignore empty recordings (e.g. the button was tapped twice quickly)
+    if len(audio_data) < 100:
+        print("Audio payload was empty.")
         return ""
-        
-    # THE FORMAT FIX: Convert iOS MP4 to Meta's strict Mono 24kHz WAV
+
+    # iOS records MP4; the API needs mono 24 kHz PCM WAV
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_in:
             temp_in.write(audio_data)
             temp_in_path = temp_in.name
-            
+
         temp_out_path = temp_in_path.replace(".mp4", ".wav")
-        
-        # Use a raw string (r"") so Windows backslashes don't break the path
-        FFMPEG_PATH = "ffmpeg"
-        
-        # Exact conversion parameters required by Meta API
+
         subprocess.run([
-            FFMPEG_PATH, "-y", "-i", temp_in_path, 
-            "-ac", "1", "-ar", "24000", 
-            "-c:a", "pcm_s16le", "-map_metadata", "-1", 
+            FFMPEG_PATH, "-y", "-i", temp_in_path,
+            "-ac", "1", "-ar", "24000",
+            "-c:a", "pcm_s16le", "-map_metadata", "-1",
             temp_out_path
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
+
         with open(temp_out_path, "rb") as f:
             wav_data = f.read()
-            
+
         os.remove(temp_in_path)
         os.remove(temp_out_path)
-        
+
     except Exception as e:
         print(f"FFmpeg conversion failed: {e}")
         return ""
@@ -225,21 +240,20 @@ async def transcribe_audio(audio_b64: str):
             "audioEncoding": "WAV"
         })
     }
-    
-    # Send the converted WAV file instead of the raw WebM/MP4
+
     files = {
         'audio': ('question.wav', wav_data, 'audio/wav')
     }
-    
+
     headers = {"Authorization": f"Bearer {META_API_KEY}"}
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                "https://api.meta.ai/v1/asr/transcribe", 
-                headers=headers, 
-                data=data, 
-                files=files, 
+                "https://api.meta.ai/v1/asr/transcribe",
+                headers=headers,
+                data=data,
+                files=files,
                 timeout=15.0
             )
             if response.status_code == 200:
@@ -247,15 +261,14 @@ async def transcribe_audio(audio_b64: str):
                 print(f"User asked: {transcript}")
                 return transcript
             else:
-                print(f"Meta Voice API Error: {response.status_code} - {response.text}")
+                print(f"Voice API error: {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"Voice Transcription failed: {e}")
+            print(f"Voice transcription failed: {e}")
     return ""
 
-# NEW: The Slow Loop Canvas Evaluator
-# NEW: The Semantic Tutor Evaluator
 async def evaluate_canvas_with_spark(b64_image_data: str, target_equation: str):
-    print("4. SLOW LOOP: Grading canvas with Muse Spark...")
+    # Tutor feedback on the student's drawing, written as a short script for text-to-speech
+    print("4. Grading the canvas with Muse Spark...")
     if b64_image_data.startswith("data:image"):
         b64_image_data = b64_image_data.split(",")[1]
 
@@ -263,37 +276,36 @@ async def evaluate_canvas_with_spark(b64_image_data: str, target_equation: str):
         "Authorization": f"Bearer {META_API_KEY}",
         "Content-Type": "application/json"
     }
-    
-    # THE FIX: Forced the prompt to explicitly demand the NEXT steps.
+
     payload = {
         "model": "muse-spark-1.3",
         "messages": [
             {
-                "role": "system", 
+                "role": "system",
                 "content": f"You are a supportive math tutor for a blind student. The target equation is: '{target_equation}'. Look at their current drawing. 1. Acknowledge what they have drawn correctly. 2. If they made a mistake, gently correct them. 3. Only confirm a mathematical symbol is correct if it is fully and clearly drawn. If it looks like a partial or unfinished stroke, tell the student to finish drawing it 4. CRITICAL: If their drawing is correct up to this point, you MUST explicitly tell them the EXACT NEXT mathematical symbol they need to draw to continue. 5. If a symbol is missing or incomplete (for example an equals sign with only one line), say exactly which symbol is incomplete. Respond ONLY with the exact spoken English script for the text-to-speech engine in 1 to 3 short sentences."
             },
             {
-                "role": "user", 
+                "role": "user",
                 "content": [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_image_data}"}}]
             }
         ]
     }
-    
+
     async with httpx.AsyncClient() as client:
         for attempt in (1, 2):
             try:
                 response = await client.post(META_CHAT_ENDPOINT, headers=headers, json=payload, timeout=25.0)
                 if response.status_code == 200:
                     verdict = response.json()["choices"][0]["message"]["content"].strip()
-                    print(f"Spark Tutor Feedback: {verdict}")
+                    print(f"Tutor feedback: {verdict}")
                     return verdict
-                print(f"Spark Evaluation attempt {attempt}: HTTP {response.status_code}: {response.text[:300]}")
+                print(f"Evaluation attempt {attempt}: HTTP {response.status_code}: {response.text[:300]}")
             except Exception as e:
-                print(f"Spark Evaluation attempt {attempt} failed: {type(e).__name__}: {e!r}")
-            await asyncio.sleep(1.5)   # a short pause, then one retry (the symbol map calls run at the same time)
+                print(f"Evaluation attempt {attempt} failed: {type(e).__name__}: {e!r}")
+            await asyncio.sleep(1.5)   # brief pause before the single retry
     return "I am having trouble seeing your drawing right now, but keep going."
 
-# --- 2. SCAN PIPELINE (camera photo -> equation -> stencil) ---
+# --- 2. Scan pipeline: camera photo -> equation -> stencil ---
 SCAN_INTRO = (
     "Welcome to FollowMath. Prop the phone up so its back camera sees the whiteboard, "
     "then tap anywhere on the phone screen and hold still until you hear the shutter sound. "
@@ -314,14 +326,14 @@ PHONE_ON = "Phone camera connected."
 PHONE_OFF = "Phone camera disconnected."
 CAMERA_ERROR_MSG = ("I couldn't open the phone camera. Please allow camera access in the phone's browser "
                     "settings, then reload the camera page on the phone.")
-NORMALIZED_WIDTH = 520   # every scanned equation is resized to this width so the navigation thresholds stay consistent
-MAX_PHOTO_SIDE = 1280    # photos are downscaled before going to Meta's models
+NORMALIZED_WIDTH = 520   # scanned equations are resized to this width so navigation thresholds stay consistent
+MAX_PHOTO_SIDE = 1280    # photos are downscaled before being sent to the models
 
-# --- LIVE MODE: the camera keeps watching the board while the student works ---
-LIVE_INK_CHANGE = 0.06   # less than 6% change in visible ink = nothing was added, skip the AI calls
+# --- Live mode: the phone keeps watching the board while the student works ---
+LIVE_INK_CHANGE = 0.06   # below 6% change in visible ink, skip the model calls
 
 def ink_signature(img):
-    # Cheap fingerprint of the board: how much ink is in view (small, blurred, adaptive threshold)
+    # Cheap fingerprint of the board: the amount of ink in view
     g = img.convert("L")
     g = g.resize((320, max(1, int(g.height * 320 / g.width))))
     g = cv2.GaussianBlur(np.array(g), (3, 3), 0)
@@ -329,11 +341,12 @@ def ink_signature(img):
     return int((ink > 0).sum())
 
 def _norm_text(t):
+    # Normalize for comparing two readings of the equation
     return re.sub(r"[^a-z0-9]+", "", str(t).lower())
 
 def _waiting_state(img):
-    # Setup only positions the camera. An empty board is normal: stay ready and let live mode
-    # announce the equation as soon as the professor starts writing.
+    # Setup only positions the camera. An empty board is expected; live mode announces
+    # the equation as soon as the professor starts writing.
     pipeline_data.update({
         "x1": 0, "y1": 0, "x2": 0, "y2": 0, "start_x": 0, "start_y": 0, "width": 0,
         "semantic_text": "", "zones": {},
@@ -345,7 +358,7 @@ def _waiting_state(img):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm the TTS cache so the common prompts play with zero delay
+    # Pre-generate common prompts so they play without delay
     print("Pre-generating common voice prompts...")
     for phrase in (SCAN_INTRO, SCAN_WAIT, "Canvas cleared. Let's start over.", "Undone.",
                    "Thinking...", "Let me check what you have written so far...",
@@ -358,7 +371,7 @@ async def lifespan(app: FastAPI):
     yield
 
 async def process_scan(image_b64: str, live: bool = False):
-    # Takes a camera photo, finds and reads the equation, and builds the stencil.
+    # Find and read the equation in a camera photo and build the ink stencil.
     # Returns {"ok": bool, "message": str, ...}
     if "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
@@ -377,69 +390,68 @@ async def process_scan(image_b64: str, live: bool = False):
     W, H = img.size
 
     if live:
-        # Cheap gate: if the amount of ink in view barely changed, nothing was added - skip the AI calls
+        # Skip the model calls when the amount of ink barely changed
         sig = ink_signature(img)
         prev = pipeline_data.get("live_sig")
         if prev and abs(sig - prev) / max(prev, 1) < LIVE_INK_CHANGE:
-            print(f"   Live frame: ink changed {abs(sig - prev) / max(prev, 1):.1%} (< {LIVE_INK_CHANGE:.0%}) - nothing new, skipped")
+            print(f"   Live frame: ink changed {abs(sig - prev) / max(prev, 1):.1%} (< {LIVE_INK_CHANGE:.0%}), skipped")
             return {"ok": True, "changed": False}
-        print(f"   Live frame: ink changed {abs(sig - (prev or sig)) / max(prev or sig, 1):.1%} - reading the board...")
-        pipeline_data["live_sig"] = sig   # remember this view so an unchanged board is not re-read
+        print(f"   Live frame: ink changed {abs(sig - (prev or sig)) / max(prev or sig, 1):.1%}, reading the board...")
+        pipeline_data["live_sig"] = sig
 
     scan_path = os.path.join(tempfile.gettempdir(), "followmath_scan.png")
     img.save(scan_path, format="PNG")
 
-    # 1. Find the equation on the board
+    # Step 1: locate the equation
     full_spark = None
     used_full_frame = False
     if live:
-        # Live frames: Spark starts reading the whole frame immediately, in parallel with SAM,
-        # so a slow or failed SAM never holds up (or silences) an update.
+        # For live frames, start Spark on the full frame in parallel with SAM so a slow or
+        # failed SAM call never delays an update.
         full_spark = asyncio.create_task(call_muse_spark(scan_path, (0, 0, W, H)))
     bbox = await call_sam_3_1(scan_path)
     if bbox is None and live:
-        print("   Live frame: SAM found no box - using Spark's read of the whole frame")
+        print("   Live frame: SAM found no box, using Spark's read of the full frame")
         bbox = (0, 0, W, H)
         used_full_frame = True
     if bbox is None:
-        # No equation on the board (yet)
-        print("SAM found no equation - waiting for the professor to start writing.")
+        print("SAM found no equation, waiting for the professor to start writing.")
         return _waiting_state(img)
     x1, x2 = max(0, min(bbox[0], bbox[2])), min(W, max(bbox[0], bbox[2]))
     y1, y2 = max(0, min(bbox[1], bbox[3])), min(H, max(bbox[1], bbox[3]))
     if (x2 - x1) < 40 or (y2 - y1) < 20:
-        x1, y1, x2, y2 = 0, 0, W, H
+        x1, y1, x2, y2 = 0, 0, W, H     # box too small to be useful: use the whole frame
     bbox = (x1, y1, x2, y2)
     print(f"Using crop {bbox} of a {W}x{H} photo")
 
-    # 2. Read it
+    # Step 2: read it
     if full_spark is not None and used_full_frame:
-        semantic_data = await full_spark          # already running since the frame arrived
+        semantic_data = await full_spark
     else:
         if full_spark is not None:
-            full_spark.cancel()                   # SAM found the equation: read just that crop, as before
+            full_spark.cancel()          # SAM found the equation, so read just the crop
         semantic_data = await call_muse_spark(scan_path, bbox)
     if live:
         if isinstance(semantic_data, dict):
             print(f"   Live frame: Spark found={semantic_data.get('found')} text={str(semantic_data.get('full_audio', ''))[:80]!r}")
         else:
-            print("   Live frame: Spark gave no usable answer - will retry on the next frame")
+            print("   Live frame: Spark gave no usable answer, will retry on the next frame")
     if isinstance(semantic_data, dict) and semantic_data.get("found") is False:
         if live:
             return {"ok": False}
         return _waiting_state(img)
     if not isinstance(semantic_data, dict) or not str(semantic_data.get("full_audio", "")).strip():
         if live and prev:
-            pipeline_data["live_sig"] = prev     # the read failed: do not mark this view as seen
+            pipeline_data["live_sig"] = prev     # read failed: don't mark this view as seen
         return {"ok": False, "message": "I had trouble reading the picture. Please tap to try again."}
 
     if live:
         pipeline_data["live_sig"] = sig
         if _norm_text(semantic_data["full_audio"]) == _norm_text(pipeline_data["semantic_text"]):
-            print("   Live frame: equation reads the same - staying silent")
-            return {"ok": True, "changed": False}   # new ink, but the equation reads the same: stay silent
+            print("   Live frame: equation reads the same, staying silent")
+            return {"ok": True, "changed": False}
 
-    # 3. Build the ink stencil (normalized size, tolerant of uneven whiteboard lighting)
+    # Step 3: build the ink stencil (normalized size, adaptive threshold for uneven lighting)
     color_crop = img.crop(bbox)
     norm_h = max(20, int(color_crop.height * NORMALIZED_WIDTH / color_crop.width))
     color_crop = color_crop.resize((NORMALIZED_WIDTH, norm_h), Image.LANCZOS)
@@ -447,7 +459,7 @@ async def process_scan(image_b64: str, live: bool = False):
     gray = cv2.GaussianBlur(np.array(color_crop.convert("L")), (3, 3), 0)
     ink = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 12)
 
-    # Drop tiny specks (dust, marker residue, sensor noise)
+    # Remove small specks (dust, marker residue, sensor noise)
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
     keep = stats[:, cv2.CC_STAT_AREA] >= 12
     keep[0] = False
@@ -483,33 +495,32 @@ async def process_scan(image_b64: str, live: bool = False):
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 3. SEMANTIC ZONES & STRICT CHRONOLOGICAL GATES ---
+# --- 3. Navigation: left -> middle -> right gates ---
 def get_smart_navigation(current_x, current_y, active_stencil):
+    # Returns a spoken correction, or None when the student is on track.
     remaining_y, remaining_x = np.where(active_stencil > 0)
-    
-    # Global completion check: If fewer than 50 total pixels remain across the whole board, you win.
-    if len(remaining_x) < 50: 
+
+    # Done when fewer than 50 stencil pixels remain anywhere
+    if len(remaining_x) < 50:
         return "Equation complete! Excellent job."
-    
+
     bound_1 = pipeline_data["width"] * 0.33
     bound_2 = pipeline_data["width"] * 0.66
     zones = pipeline_data["zones"]
-    
-    # THE FIX: Volumetric counting instead of absolute min(). 
-    # Count how many ink pixels are actually left in each specific zone.
+
+    # Count the stencil pixels still uncovered in each zone
     left_remaining_count = np.sum(remaining_x < bound_1)
     center_remaining_count = np.sum((remaining_x >= bound_1) & (remaining_x < bound_2))
-    
-    # Quiet by default: only speak when the student has drifted off track.
-    # (Returning None means "on track, say nothing".)
 
-    # GATE 1: The Left Side - the first part is not finished yet
+    # Stay quiet unless the student drifts off track.
+
+    # Left third not finished yet
     if left_remaining_count > 150:
         if current_x > bound_1 + 40:
             return f"You drifted too far right. Go back left to finish: {zones.get('left_audio', 'the first part')}."
         return None
 
-    # GATE 2: The Middle Section
+    # Middle third
     elif center_remaining_count > 150:
         if current_x < bound_1 - 40:
             return "Move right to reach the middle of the equation."
@@ -517,13 +528,13 @@ def get_smart_navigation(current_x, current_y, active_stencil):
             return "You drifted too far right. Go back left to the middle of the equation."
         return None
 
-    # GATE 3: The Right Side
+    # Right third
     else:
         if current_x < bound_2 - 40:
             return "Move right to finish the equation."
         return None
 
-# --- 4. FRONTEND HTML/JS ---
+# --- 4. iPad frontend ---
 html_template = """
 <!DOCTYPE html>
 <html>
@@ -537,16 +548,16 @@ html_template = """
         .muse-translation { background: #181825; padding: 8px 20px; border-radius: 6px; color: #a6adc8; font-size: 14px; margin-bottom: 15px; text-align: center; max-width: 95%; font-style: italic; border-left: 4px solid #cba6f7; }
         #canvas-container { width: 95%; flex-grow: 1; position: relative; }
         canvas { width: 100%; height: 100%; background: #2a2a3b; border: 2px dashed #6c7086; border-radius: 8px; touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-        /* Fat thumb sized square, locked to the bottom right of the iPad screen */
+        /* Large touch target pinned to the bottom right */
         #mic-btn { position: fixed; bottom: 20px; right: 20px; background: #cba6f7; color: #11111b; border: none; border-radius: 16px; width: 72px; height: 72px; font-size: 32px; box-shadow: 0 6px 12px rgba(0,0,0,0.5); cursor: pointer; display: flex; align-items: center; justify-content: center; touch-action: manipulation; transition: transform 0.2s; z-index: 999; }
         #mic-btn:active { transform: scale(0.92); }
         #mic-btn.recording { background: #f38ba8; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(243, 139, 168, 0.7); } 70% { box-shadow: 0 0 0 15px rgba(243, 139, 168, 0); } 100% { box-shadow: 0 0 0 0 rgba(243, 139, 168, 0); } }
-        
-        /* Make sure the status box doesn't overlap the button */
-        #status-box { margin-top: 15px; padding: 15px; background: #313244; border-radius: 8px; width: 95%; text-align: center; font-size: 20px; font-weight: bold; min-height: 30px; box-sizing: border-box; margin-bottom: 20px; }
+
+        /* Side padding keeps the status text clear of the mic button */
+        #status-box { margin-top: 15px; padding: 15px 100px; background: #313244; border-radius: 8px; width: 95%; text-align: center; font-size: 20px; font-weight: bold; min-height: 60px; box-sizing: border-box; margin-bottom: 20px; }
         .hidden { display: none !important; }
-        /* Live mode: the camera keeps running but is invisible, so the board can be re-read while the student draws */
+        /* Camera stays active but invisible so the board can be re-read while the student draws */
         #scanner-view.bg-camera { width: 4px; height: 4px; opacity: 0; pointer-events: none; z-index: -1; overflow: hidden; }
         #scanner-view { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; z-index: 500; touch-action: manipulation; }
         #cam-video { width: 100%; height: 100%; object-fit: cover; }
@@ -554,20 +565,21 @@ html_template = """
         #draw-view { width: 100%; flex-grow: 1; display: flex; flex-direction: column; align-items: center; min-height: 0; }
         #cam-btn { position: fixed; bottom: 20px; left: 20px; background: #89b4fa; color: #11111b; border: none; border-radius: 16px; width: 72px; height: 72px; font-size: 32px; box-shadow: 0 6px 12px rgba(0,0,0,0.5); cursor: pointer; display: flex; align-items: center; justify-content: center; touch-action: manipulation; z-index: 999; }
         #cam-btn:active { transform: scale(0.92); }
+        #cam-btn { display: none !important; }   /* hidden: rescanning is done by voice ("scan a new equation") */
     </style>
 </head>
 <body>
     <div id="start-overlay" role="button" aria-label="Start FollowMath AI. Tap anywhere.">Tap anywhere to start FollowMath AI</div>
 
-    <!-- A permanent HTML audio element so Safari stops killing our audio queue -->
+    <!-- One persistent audio element; Safari drops queued audio when elements are recreated -->
     <audio id="voice-player" playsinline></audio>
 
-    <!-- SCANNER VIEW: full-screen camera, tap anywhere to take the picture -->
+    <!-- Scanner view: full-screen, tap anywhere to take the picture -->
     <div id="scanner-view" class="hidden" role="button" aria-label="Tap anywhere to take a picture of the whiteboard with the phone camera.">
         <div id="scan-hint">Tap anywhere to take a picture</div>
     </div>
 
-    <!-- DRAWING VIEW: shown after a successful scan -->
+    <!-- Drawing view: shown after a successful scan -->
     <div id="draw-view" class="hidden">
         <img id="reference-img" alt="Scanned equation">
         <div class="muse-translation">Muse Spark Translation: "<span id="semantic-text"></span>"</div>
@@ -588,7 +600,7 @@ html_template = """
         const startOverlay = document.getElementById("start-overlay");
         const voicePlayer = document.getElementById("voice-player");
         const scannerView = document.getElementById("scanner-view");
-        let phoneConnected = false;     // the phone (camera) page is connected to the server
+        let phoneConnected = false;     // whether the phone camera page is connected
         let scanTimeout = null;
         let liveWanted = false;
         const scanHint = document.getElementById("scan-hint");
@@ -605,7 +617,7 @@ html_template = """
         }
 
         function resizeCanvas(force) {
-            if (container.clientWidth === 0) return;   // hidden while scanning
+            if (container.clientWidth === 0) return;   // container is hidden
             if (!force && canvas.width === container.clientWidth && canvas.height === container.clientHeight) return;
             canvas.width = container.clientWidth;
             canvas.height = container.clientHeight;
@@ -615,11 +627,11 @@ html_template = """
         applyInkStyle();
 
         let isDrawing = false;
-        let chunkPath = []; 
+        let chunkPath = [];
         let currentStroke = [];
-        let strokeHistory = []; 
+        let strokeHistory = [];
         let lastHoverTime = 0;
-        
+
         let audioQueue = [];
         let isPlaying = false;
         let evaluationTimeout;
@@ -631,8 +643,8 @@ html_template = """
         let isRecordingHelp = false;
         let micStarting = false;
 
-        // ---------- TOUCH EXPLORER: finger = hear symbols, pen = draw ----------
-        let strokeVersion = 0;            // bumps every time the drawing changes
+        // ---------- Touch explorer: finger = hear symbols, pencil = draw ----------
+        let strokeVersion = 0;            // incremented whenever the drawing changes
         let symbolMap = { version: -1, segments: [], nothing: null, left: null, right: null };
         let touchActiveId = null;
         let lastSymbolIndex = -2;
@@ -640,7 +652,7 @@ html_template = """
         let lastMapRequest = 0;
         let lastPenTime = 0;
         function markCanvasChanged() { strokeVersion++; }
-        let boardReady = false;           // false until an equation has appeared on the board
+        let boardReady = false;           // false until an equation has been read from the board
 
         let camStream = null;
         let scanBusy = false;
@@ -648,8 +660,7 @@ html_template = """
         let audioCtx = null;
 
         async function startRecording() {
-            // Fresh mic stream every time: a long-lived stream gets muted by Safari
-            // once audio playback starts on the page.
+            // Open a fresh mic stream each time: Safari mutes long-lived streams once playback starts
             micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             audioChunks = [];
             mediaRecorder = new MediaRecorder(micStream);
@@ -662,7 +673,7 @@ html_template = """
                 const chunks = audioChunks;
                 audioChunks = [];
 
-                // Release the mic so playback volume/routing returns to normal
+                // Release the mic so playback routing returns to normal
                 if (micStream) {
                     micStream.getTracks().forEach(t => t.stop());
                     micStream = null;
@@ -702,14 +713,14 @@ html_template = """
                 playNextAudio();
             });
         }
-        
+
         const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
 
         startOverlay.addEventListener("pointerdown", () => {
             startOverlay.style.display = "none";
 
-            // Unlock audio playback and beeps on the first tap (iOS requirement)
+            // iOS only allows audio after a user gesture, so unlock playback on the first tap
             voicePlayer.src = "data:audio/mp3;base64,";
             voicePlayer.play().catch(() => {});
             try {
@@ -727,7 +738,7 @@ html_template = """
             e.preventDefault();
             if (micStarting || mode !== "draw") return;
 
-            // STOP RECORDING
+            // Stop recording
             if (mediaRecorder && mediaRecorder.state === "recording") {
                 mediaRecorder.stop();
                 isRecordingHelp = false;
@@ -736,7 +747,7 @@ html_template = """
                 return;
             }
 
-            // START RECORDING
+            // Start recording
             micStarting = true;
             isRecordingHelp = true;
             pushLive();
@@ -761,7 +772,7 @@ html_template = """
             }
         });
 
-        // ---------- CAMERA / WHITEBOARD SCANNING ----------
+        // ---------- Whiteboard scanning ----------
         function setStatus(t) {
             statusBox.innerText = t;
             scanHint.innerText = t;
@@ -787,12 +798,11 @@ html_template = """
             } catch (e) { console.error("Beep failed:", e); }
         }
 
-        // (The camera now lives on the phone: open /camera there. The iPad never opens a camera.)
+        // The camera lives on the phone (/camera). The iPad never opens a camera.
 
         function enterDrawMode() {
-            // The iPad goes straight to the drawing screen. The picture of the board is taken on the PHONE
-            // (open /camera there): tap the phone screen, it beeps and clicks its shutter, and the result
-            // arrives here.
+            // Go straight to the drawing screen. The whiteboard picture is taken on the phone;
+            // the result arrives here over the websocket.
             mode = "draw";
             scanBusy = false;
             boardReady = false;
@@ -810,7 +820,7 @@ html_template = """
         }
 
         function requestRescan() {
-            // "Scan a new equation" (camera button or voice): ask the phone to run its beeps + shutter
+            // Ask the phone to run its countdown beeps and take a new picture
             if (scanBusy) return;
             scanBusy = true;
             setStatus("Asking the phone to take a new picture...");
@@ -834,12 +844,12 @@ html_template = """
             requestRescan();
         });
 
-        // ---------- LIVE MODE: re-read the board every few seconds ----------
+        // ---------- Live mode: the board is re-read every few seconds ----------
         const LIVE_INTERVAL_MS = 8000;
         let liveTimer = null;
 
-        // The phone runs the 8-second timer and sends the frames; the iPad only says when it wants them
-        // (in drawing mode, and not while the student is speaking a question).
+        // The phone owns the timer and sends the frames. The iPad only says whether it wants them
+        // (drawing mode, and not while the student is recording a question).
         function pushLive() {
             sendWS({ action: "live_control", on: liveWanted && !isRecordingHelp });
         }
@@ -867,7 +877,7 @@ html_template = """
         }
 
         function applyLiveUpdate(r) {
-            // The professor wrote more: refresh the reference picture and text, but keep the student's drawing
+            // The professor wrote more: refresh the reference image and text, keep the student's drawing
             boardReady = true;
             refImg.style.display = "";
             document.querySelector(".muse-translation").style.display = "";
@@ -878,12 +888,12 @@ html_template = """
 
         function applyScan(r) {
             if (!r.ok) {
-                // Camera is still running: the user just taps again to retry
+                // The camera keeps running, so the user can simply tap again
                 scanBusy = false;
                 scanHint.innerText = "Tap anywhere to try again";
                 return;
             }
-            // The camera is NOT stopped: live mode keeps watching the board in the background
+            // Camera stays on: live mode keeps watching the board in the background
             mode = "draw";
             scanBusy = false;
             scannerView.classList.add("hidden");
@@ -916,14 +926,14 @@ html_template = """
 
         function undoLastStroke() {
             if (strokeHistory.length === 0) {
-                // Tell the user out loud instead of failing silently
+                // Let the server announce it, since the user can't see the screen
                 ws.send(JSON.stringify({ action: "undo_canvas", history: [], nothing_to_undo: true }));
                 return;
             }
-            strokeHistory.pop(); 
+            strokeHistory.pop();
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.beginPath();
-            
+
             strokeHistory.forEach(stroke => {
                 if(stroke.length > 0) {
                     ctx.moveTo(stroke[0][0], stroke[0][1]);
@@ -971,11 +981,11 @@ html_template = """
                 return;
             }
             if (response.action === "symbol_map_failed") return;
-            if (response.action === "live_update") applyLiveUpdate(response);   // then falls through to speak the message
+            if (response.action === "live_update") applyLiveUpdate(response);   // falls through so the message is spoken
             if (response.action === "phone_status") phoneConnected = !!response.connected;
             if (response.action === "scan_result") { clearTimeout(scanTimeout); applyScan(response); }
 
-            // Drop any tutor audio that arrives while the mic is open
+            // Ignore tutor audio while the mic is open
             if (isRecordingHelp && response.audio_b64) return;
 
             if (response.message) setStatus(response.message);
@@ -1000,9 +1010,8 @@ html_template = """
             return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
         }
 
-        // Export a high-contrast picture for the AI tutor: black ink on white, thicker lines, 2x size.
-        // (The raw canvas is thin green ink on a TRANSPARENT background, which the model can read
-        // as "nothing" or "a scribble" - thin symbols like = suffer the most.)
+        // Export a high-contrast image for the models: black ink on white, thicker lines, 2x size.
+        // The raw canvas (thin green ink on transparent) is often misread, especially thin symbols like "=".
         function getSnapshot() {
             const k = 2;
             const out = document.createElement("canvas");
@@ -1026,8 +1035,8 @@ html_template = """
             return out.toDataURL("image/png");
         }
 
-        // ---------- FINGER EXPLORER ----------
-        // Which symbol is under the finger? Boxes are padded because a fingertip is imprecise.
+        // ---------- Finger explorer ----------
+        // Find the symbol under the finger. Boxes are padded because a fingertip is imprecise.
         function symbolAt(pos) {
             const W = canvas.width, H = canvas.height, pad = 22;
             let best = -1, bestDist = Infinity;
@@ -1064,7 +1073,7 @@ html_template = """
                 playClip(s.audio_b64);
                 return;
             }
-            // Empty space: say which way the nearest symbol is
+            // Empty space: say which direction the nearest symbol is
             let clip = symbolMap.nothing, text = "Nothing here.";
             let nearest = null, nd = Infinity;
             symbolMap.segments.forEach(s => {
@@ -1082,7 +1091,7 @@ html_template = """
 
         function requestMap() {
             const now = Date.now();
-            if (now - lastMapRequest < 3000) return;   // already asked; the server is working on it
+            if (now - lastMapRequest < 3000) return;   // a request is already in progress
             lastMapRequest = now;
             setStatus("Checking what you wrote...");
             ws.send(JSON.stringify({ action: "map_canvas", image_b64: getSnapshot(), version: strokeVersion, announce: true }));
@@ -1090,7 +1099,7 @@ html_template = """
 
         function startExplore(e) {
             if (isDrawing || isRecordingHelp) return;
-            if (Date.now() - lastPenTime < 700) return;   // palm resting after the pencil lifted
+            if (Date.now() - lastPenTime < 700) return;   // ignore the palm right after the pencil lifts
             if (touchActiveId !== null) return;
             e.preventDefault();
             touchActiveId = e.pointerId;
@@ -1098,7 +1107,7 @@ html_template = """
             try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
 
             if (symbolMap.version !== strokeVersion) {
-                requestMap();                              // the drawing changed since the last map
+                requestMap();                              // drawing changed since the last map
                 return;
             }
             exploreAt(getPos(e), true);
@@ -1117,12 +1126,12 @@ html_template = """
             lastSymbolIndex = -2;
         }
 
-        // ---------- DRAWING (pencil only; a finger explores instead) ----------
+        // ---------- Drawing (pencil only; a finger explores instead) ----------
         let activePointerId = null;
         let activePointerType = "";
 
         function addPoint(pos) {
-            // Stroke ONE segment at a time (re-stroking the whole growing path every move is slow and smears)
+            // Stroke one segment at a time; re-stroking the whole path on every move is slow and smears
             ctx.lineTo(pos.x, pos.y);
             ctx.stroke();
             ctx.beginPath();
@@ -1147,6 +1156,7 @@ html_template = """
             if (currentStroke.length > 1) { strokeHistory.push([...currentStroke]); markCanvasChanged(); }
             lastPenTime = Date.now();
 
+            // Ask for feedback after 4 seconds without a new stroke
             pendingStrokes = true;
             evaluationTimeout = setTimeout(() => {
                 if (pendingStrokes && !isRecordingHelp) {
@@ -1158,11 +1168,11 @@ html_template = """
 
         canvas.addEventListener("pointerdown", (e) => {
             if (mode !== "draw") return;
-            if (e.pointerType === "touch") { startExplore(e); return; }   // finger = explore, never draw
-            if (!boardReady) return;                                       // nothing to follow until the board has an equation
+            if (e.pointerType === "touch") { startExplore(e); return; }   // finger explores, never draws
+            if (!boardReady) return;                                       // no equation to follow yet
 
             if (isDrawing) {
-                // A pencil always wins over a palm/finger that started the stroke first
+                // The pencil takes priority over a palm or finger that started the stroke
                 if (e.pointerType === "pen" && activePointerType !== "pen") finishStroke();
                 else return;
             }
@@ -1171,7 +1181,7 @@ html_template = """
             isDrawing = true;
             activePointerId = e.pointerId;
             activePointerType = e.pointerType;
-            // Keep receiving this pointer's events even if it slides off the canvas edge
+            // Keep receiving this pointer's events even if it leaves the canvas
             try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
 
             chunkPath = [];
@@ -1196,8 +1206,8 @@ html_template = """
             }
             if (!isDrawing || e.pointerId !== activePointerId) return;
 
-            // The Pencil samples ~240 times/sec but the browser delivers one event per frame.
-            // getCoalescedEvents() returns every sample, so quick strokes like = keep their shape.
+            // The Pencil samples ~240 Hz but the browser fires one event per frame.
+            // Coalesced events recover the missing samples so quick strokes like "=" keep their shape.
             const samples = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
             for (const ev of samples) addPoint(getPos(ev));
 
@@ -1211,12 +1221,11 @@ html_template = """
         canvas.addEventListener("pointerup", (e) => {
             if (e.pointerType === "touch") { endExplore(e); return; }
             if (!isDrawing || e.pointerId !== activePointerId) return;
-            addPoint(getPos(e));   // a very fast flick may have produced no move events at all
+            addPoint(getPos(e));   // a fast flick may produce no move events
             finishStroke();
         });
 
-        // iPadOS can cancel a touch/pencil stroke (system gesture, palm, etc.).
-        // Previously that left the page stuck mid-stroke and the stroke was never saved.
+        // iPadOS can cancel a stroke (system gesture, palm, etc.); finish it so it isn't lost
         canvas.addEventListener("pointercancel", (e) => {
             if (e.pointerType === "touch") { endExplore(e); return; }
             if (e.pointerId === activePointerId) finishStroke();
@@ -1232,7 +1241,7 @@ html_template = """
 async def get_ui():
     return HTMLResponse(html_template)
 
-# --- 5. PHONE CAMERA PAGE (open  <your-ngrok-url>/camera  on the phone) ---
+# --- 5. Phone camera page (open <server-url>/camera on the phone) ---
 camera_html = """
 <!DOCTYPE html>
 <html>
@@ -1258,7 +1267,7 @@ camera_html = """
         const stateEl = document.getElementById("state");
         const dot = document.getElementById("dot");
         const startEl = document.getElementById("start");
-        const LIVE_INTERVAL_MS = 8000;      // re-read the board every 8 seconds while the iPad is in drawing mode
+        const LIVE_INTERVAL_MS = 8000;      // how often to send a frame while the iPad is in drawing mode
         const READY_TEXT = "Tap anywhere to take a picture";
         let ws = null, camStream = null, liveOn = false, liveTimer = null, wakeLock = null;
         let started = false, busy = false, busyTimer = null, audioCtx = null, scanned = false;
@@ -1294,13 +1303,13 @@ camera_html = """
         function setBusy(b) {
             busy = b;
             clearTimeout(busyTimer);
-            if (b) busyTimer = setTimeout(() => { busy = false; setState(READY_TEXT); }, 45000);   // never get stuck
+            if (b) busyTimer = setTimeout(() => { busy = false; setState(READY_TEXT); }, 45000);   // safety reset
         }
 
-        // Tap anywhere: three low beeps (hold still), then a high shutter beep and the picture
+        // Three low beeps (hold still), then a high shutter beep and the capture
         function takePicture(fromIpad) {
             if (busy || !camStream) return;
-            if (!fromIpad && (scanned || liveOn)) return;   // once the board is being watched, a tap does nothing
+            if (!fromIpad && (scanned || liveOn)) return;   // once the board is being watched, taps do nothing
             setBusy(true);
             setState("Hold still...");
             beep(500, 0.12);
@@ -1340,7 +1349,7 @@ camera_html = """
             ws.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
                 if (msg.action === "capture") {
-                    takePicture(true);                   // the iPad asked for a new picture: same beeps + shutter here
+                    takePicture(true);                   // the iPad requested a new picture
                 } else if (msg.action === "live") {
                     setLive(!!msg.on);
                 } else if (msg.action === "info") {
@@ -1368,10 +1377,10 @@ camera_html = """
                 const send = () => ws.send(JSON.stringify({ action: "camera_error" }));
                 if (ws && ws.readyState === 1) send(); else if (ws) ws.addEventListener("open", send, { once: true });
             }
-            try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}   // keep the phone awake
+            try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}   // keep the screen awake
         }
 
-        // The camera never starts by itself: the first tap starts it (and unlocks the beeps)
+        // The first tap starts the camera and unlocks audio for the beeps
         startEl.addEventListener("pointerdown", (e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -1382,7 +1391,7 @@ camera_html = """
             setState("Starting the camera...");
             connect();
             startCamera();
-            setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: "ping" })); }, 20000);
+            setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: "ping" })); }, 20000);   // keepalive
         });
 
         document.addEventListener("pointerdown", (e) => {
@@ -1391,6 +1400,7 @@ camera_html = """
             takePicture();
         });
         document.addEventListener("visibilitychange", async () => {
+            // Wake locks are released when the page is hidden, so request it again
             if (document.visibilityState === "visible" && camStream) {
                 try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
             }
@@ -1406,7 +1416,7 @@ async def get_camera_ui():
 
 @app.websocket("/ws/camera")
 async def camera_endpoint(websocket: WebSocket):
-    # The phone: it only takes pictures. Every frame is handed to the iPad's session, which does all the work.
+    # Phone side: only captures images. Frames are forwarded to the iPad session, which does the processing.
     await websocket.accept()
     hub["phone_ws"] = websocket
     print("Phone camera connected.")
@@ -1425,7 +1435,7 @@ async def camera_endpoint(websocket: WebSocket):
                     await websocket.send_json({"action": "scan_done", "ok": False,
                                                "text": "The iPad is not connected. Open the iPad page first."})
                 else:
-                    print(f"   Phone sent {payload.get('action')} but no iPad page is connected - dropped")
+                    print(f"   Phone sent {payload.get('action')} but no iPad page is connected, dropped")
     except WebSocketDisconnect:
         print("Phone camera disconnected.")
     except Exception as e:
@@ -1441,8 +1451,8 @@ async def camera_endpoint(websocket: WebSocket):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    # The iPad's own messages AND the phone's camera frames both arrive through one queue,
-    # so the whole session logic below runs exactly as before.
+    # The iPad's own messages and the phone's camera frames share one queue,
+    # so the session loop below handles both the same way.
     inbox = asyncio.Queue()
     hub.setdefault("sessions", []).append((websocket, inbox))
     hub["ipad_ws"] = websocket
@@ -1451,13 +1461,14 @@ async def websocket_endpoint(websocket: WebSocket):
     print(f"iPad session opened ({len(hub['sessions'])} open)")
 
     async def pump():
+        # Forward incoming iPad messages into the queue
         try:
             while True:
                 inbox.put_nowait(json.loads(await websocket.receive_text()))
         except Exception:
             pass
         finally:
-            inbox.put_nowait(None)      # tells the main loop the iPad is gone
+            inbox.put_nowait(None)      # signals the main loop that the iPad disconnected
 
     pump_task = asyncio.create_task(pump())
     await websocket.send_json({"action": "phone_status", "connected": hub["phone_ws"] is not None})
@@ -1465,15 +1476,15 @@ async def websocket_endpoint(websocket: WebSocket):
     anchor_x = None
     anchor_y = None
     scale_factor = 1.0
-    active_stencil = None          # set once a whiteboard has been scanned
+    active_stencil = None          # set once an equation has been scanned
 
     last_spoken_direction = ""
     last_audio_time = 0
 
-    # --- Touchable symbol map: SAM + Spark segment and name what the student drew ---
+    # --- Touchable symbol map: SAM segments the drawing and Spark names each symbol ---
     map_ctx = {"task": None, "version": None, "announce": False}
-    live_task = None               # only one live board check in flight at a time
-    drawn_points = []              # every point the student has drawn, so we can replay it if the board changes
+    live_task = None               # at most one live board read in flight
+    drawn_points = []              # every point drawn, kept so strokes can be replayed if the board changes
     canvas_width_seen = 800
 
     async def run_map(img_b64, version):
@@ -1510,7 +1521,7 @@ async def websocket_endpoint(websocket: WebSocket):
     def start_map(img_b64, version, announce):
         t = map_ctx["task"]
         if t and not t.done() and map_ctx["version"] == version:
-            map_ctx["announce"] = map_ctx["announce"] or announce   # same picture already being mapped
+            map_ctx["announce"] = map_ctx["announce"] or announce   # this version is already being mapped
             return
         if t and not t.done():
             t.cancel()
@@ -1518,8 +1529,8 @@ async def websocket_endpoint(websocket: WebSocket):
         map_ctx["task"] = asyncio.create_task(run_map(img_b64, version))
 
     async def run_live(img_b64):
-        # The professor kept writing: re-read the board, and if the equation changed, update the stencil
-        # (keeping the student's own drawing) and tell the student what is new. Silent if nothing changed.
+        # Re-read the board after the professor writes more. If the equation changed, rebuild the stencil
+        # (keeping the student's drawing) and announce what is new. Stays silent if nothing changed.
         nonlocal active_stencil, scale_factor, furthest_x, next_evaluation_checkpoint, last_spoken_direction
         try:
             old_text = pipeline_data["semantic_text"]
@@ -1527,9 +1538,9 @@ async def websocket_endpoint(websocket: WebSocket):
             if not result.get("changed"):
                 return
             new_text = pipeline_data["semantic_text"]
-            print(f"   Live frame: board changed -> announcing: {new_text}")
+            print(f"   Live frame: board changed, announcing: {new_text}")
 
-            # Fresh stencil for the longer equation, then replay what the student already drew onto it
+            # Rebuild the stencil for the longer equation and replay the student's strokes onto it
             active_stencil = pipeline_data["raw_stencil_mask"].copy()
             furthest_x = pipeline_data["start_x"]
             stencil_width = pipeline_data["x2"] - pipeline_data["x1"]
@@ -1546,7 +1557,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 progress = max(0.0, (furthest_x - pipeline_data["start_x"]) / stencil_width)
                 next_evaluation_checkpoint = (int(progress / 0.25) + 1) * 0.25
 
-            # Say only what is new when the old equation is still the beginning of the new one
+            # If the old text is a prefix of the new text, only announce the addition
             if not old_text:
                 msg = f"The professor started writing. It reads: {new_text}."
             elif new_text.lower().startswith(old_text.lower()) and len(new_text) > len(old_text):
@@ -1566,8 +1577,8 @@ async def websocket_endpoint(websocket: WebSocket):
             print(f"Live update failed: {e}")
 
     furthest_x = 0
-    next_evaluation_checkpoint = 0.25   # Spark checks at 25%, 50%, 75%, and 100% completion
-    eval_task = None                    # only one canvas evaluation in flight at a time
+    next_evaluation_checkpoint = 0.25   # tutor feedback at 25%, 50%, 75% and 100% progress
+    eval_task = None                    # at most one canvas evaluation in flight
 
     try:
         while True:
@@ -1579,7 +1590,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if action not in ("draw_stream", "hover"):
                 print(f"WS action received: {action}")
 
-            # ---------- SCANNING ----------
+            # ---------- Scanning ----------
             if action == "request_intro":
                 audio = await get_fast_voice(SCAN_INTRO)
                 await websocket.send_json({"message": SCAN_INTRO, "audio_b64": audio, "priority": True})
@@ -1603,7 +1614,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if action == "scan_request":
-                # The student tapped the iPad: ask the phone to take the picture
+                # The student asked for a new scan: tell the phone to take the picture
                 phone = hub["phone_ws"]
                 sent = False
                 if phone is not None:
@@ -1643,7 +1654,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await notify_phone({"action": "scan_done", "ok": result["ok"], "text": phone_text})
 
                 if result["ok"]:
-                    # Fresh session state for the new equation
+                    # Reset session state for the new equation
                     drawn_points.clear()
                     active_stencil = pipeline_data["raw_stencil_mask"].copy()
                     anchor_x = None
@@ -1666,7 +1677,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
-            # Everything below needs a scanned equation
+            # Everything below requires a scanned equation
             if active_stencil is None:
                 continue
 
@@ -1693,7 +1704,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 active_stencil = pipeline_data["raw_stencil_mask"].copy()
                 furthest_x = pipeline_data["start_x"]
 
-                # Rebuild the AI stencil mask based on the remaining strokes
+                # Rebuild the stencil from the strokes that remain
                 for stroke in history:
                     for px, py in stroke:
                         drawn_points.append((px, py))
@@ -1717,7 +1728,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if action == "map_canvas":
-                # The student touched their writing with a finger and the symbol map is out of date
+                # The student touched their writing and the symbol map is out of date
                 map_img = payload.get("image_b64")
                 if map_img:
                     audio = await get_fast_voice(MAP_WAIT)
@@ -1729,10 +1740,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not pipeline_data["ready"]:
                     continue
                 image_data = payload.get("image_b64")
-                # Rebuild the touchable symbol map from this same picture (runs in the background)
+                # Refresh the symbol map from the same image (runs in the background)
                 if image_data:
                     start_map(image_data, payload.get("version", 0), False)
-                # Only allow ONE evaluation in flight; drop extras instead of queuing them
+                # One evaluation at a time; extra requests are dropped, not queued
                 if image_data and (eval_task is None or eval_task.done()):
                     async def run_eval(img):
                         nonlocal last_spoken_direction
@@ -1749,7 +1760,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if action == "ask_tutor":
-                # The user's question always wins over a running evaluation
+                # A spoken question takes priority over any running evaluation
                 if eval_task and not eval_task.done():
                     eval_task.cancel()
 
@@ -1757,7 +1768,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 image_data = payload.get("image_b64")
 
                 if audio_data and image_data:
-                    # 1. Transcribe what the user said
+                    # 1. Transcribe the question
                     user_question = await transcribe_audio(audio_data)
                     user_lower = user_question.lower()
 
@@ -1766,7 +1777,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"message": "Audio failed.", "audio_b64": err, "priority": True})
                         continue
 
-                    # NLP intent routing
+                    # Voice commands
                     if any(k in user_lower for k in ("new equation", "another equation", "scan", "retake",
                                                      "take a picture", "take a photo", "new picture", "new photo")):
                         await websocket.send_json({"action": "force_rescan"})
@@ -1778,7 +1789,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         await websocket.send_json({"action": "force_clear"})
                         continue
 
-                    # 2. Feed the transcript and current drawing back to Spark
+                    # 2. Otherwise, answer the question using the current drawing as context
                     ack_audio = await get_fast_voice("Thinking...")
                     await websocket.send_json({"message": "Thinking...", "audio_b64": ack_audio, "priority": True})
 
@@ -1809,7 +1820,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_json({"message": answer, "audio_b64": answer_audio, "priority": True})
                                 last_spoken_direction = answer
                             else:
-                                print(f"Spark Q&A API Error: {response.status_code} - {response.text}")
+                                print(f"Spark Q&A API error: {response.status_code} - {response.text}")
                                 fail_audio = await get_fast_voice("Sorry, I couldn't answer that. Please try again.")
                                 await websocket.send_json({"message": "Spark Q&A failed.", "audio_b64": fail_audio, "priority": True})
                         except Exception as e:
@@ -1832,7 +1843,7 @@ async def websocket_endpoint(websocket: WebSocket):
             path = payload.get("path", [])
             canvas_width_seen = payload.get("canvas_width", canvas_width_seen)
             if not pipeline_data["ready"]:
-                # Nothing on the board yet: there is no equation to follow
+                # No equation on the board yet, so there is nothing to follow
                 if now - last_audio_time > 10.0:
                     audio = await get_fast_voice(NOT_READY_MSG)
                     await websocket.send_json({"message": NOT_READY_MSG, "audio_b64": audio, "priority": True})
@@ -1842,6 +1853,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             if anchor_x is None:
+                # First stroke: anchor the stencil to where the student started and scale it to fit the canvas
                 anchor_x, anchor_y = path[0]
                 canvas_width = payload.get("canvas_width", 800)
                 available_width = canvas_width - anchor_x
@@ -1860,20 +1872,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 drawn_points.append((px, py))
                 norm_x = int((px - anchor_x) / scale_factor) + pipeline_data["start_x"]
                 norm_y = int((py - anchor_y) / scale_factor) + pipeline_data["start_y"]
-                cv2.circle(active_stencil, (norm_x, norm_y), 20, 0, -1)
+                cv2.circle(active_stencil, (norm_x, norm_y), 20, 0, -1)   # erase the covered part of the stencil
 
-                # Update furthest horizontal progress
+                # Track the furthest horizontal progress
                 if norm_x > furthest_x:
                     furthest_x = norm_x
 
-            # CHRONOLOGICAL EVALUATION LOGIC
+            # Request tutor feedback each time progress crosses a 25% checkpoint
             stencil_width = pipeline_data["x2"] - pipeline_data["x1"]
             if stencil_width > 0:
                 current_progress = (furthest_x - pipeline_data["start_x"]) / stencil_width
-                # If they crossed the next 25% boundary, ask the frontend for an image
                 if current_progress >= next_evaluation_checkpoint:
                     await websocket.send_json({"action": "request_snapshot"})
-                    # Jump past the current progress instead of stepping 0.25 at a time
+                    # Skip ahead to the next checkpoint past the current progress
                     next_evaluation_checkpoint = (int(current_progress / 0.25) + 1) * 0.25
 
             last_px, last_py = path[-1]
@@ -1882,7 +1893,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             nav_text = get_smart_navigation(norm_last_x, norm_last_y, active_stencil)
 
-            # Speaks only to correct drift; a correction repeats at most every 8 seconds while still off track.
+            # Speak only to correct drift; repeat a correction at most every 8 seconds
             if nav_text and (nav_text != last_spoken_direction or
                              (nav_text.startswith(("You drifted", "Move right")) and now - last_audio_time > 8.0)):
                 audio = await get_fast_voice(nav_text)
@@ -1901,7 +1912,7 @@ async def websocket_endpoint(websocket: WebSocket):
         hub["sessions"] = [x for x in hub.get("sessions", []) if x[1] is not inbox]
         if hub["inbox"] is inbox:
             if hub["sessions"]:
-                # another iPad page is still open: hand the phone's frames back to it
+                # Another iPad page is still open: hand the phone's frames to it
                 hub["ipad_ws"], hub["inbox"] = hub["sessions"][-1]
             else:
                 hub["ipad_ws"] = None
