@@ -19,7 +19,7 @@ Math is taught on boards, slides, and paper. A student who cannot see them has t
 
 1. **Reads the board.** A phone is propped up facing the whiteboard. The app takes a picture, finds the equation and reads it aloud.
 2. **Keeps up with the instructor.** The phone keeps watching the board. When the instructor writes more, the app updates and tells the student using audio cues.
-3. **Guides the student's writing.** The student writes the equation on an iPad with a stylus. The app stays quiet while the student is on track, and says things like "Move right to reach the middle of the equation" when they drift.
+3. **Guides the student's writing.** The student writes the equation on a tablet with a stylus. The app stays quiet while the student is on track, and says things like "Move right to reach the middle of the equation" when they drift.
 4. **Checks the work.** When the student pauses, the app looks at what they wrote and gives short spoken feedback, like a patient tutor.
 5. **Lets the student feel their own writing.** After writing, the student slides a finger over the screen. The app names each symbol under the finger, such as "the letter y", "an equals sign", "the digit 2". If a symbol is unfinished or messy, it says so honestly (for example "a single horizontal line" or "a scribble") instead of guessing what the student meant.
 6. **Answers spoken questions.** The microphone button is permanently anchored in the extreme bottom-right corner of the screen. Because a visually impaired user cannot see floating digital menus, fixing this button against the physical edge allows them to instantly find it by touch without guessing. The student simply taps this tactile corner, asks a question, and taps again to send it.
@@ -32,7 +32,7 @@ Math is taught on boards, slides, and paper. A student who cannot see them has t
 Two devices connect to one small server on your computer.
 
 ```
-   Phone (camera)                 Your computer                 iPad (student)
+   Phone (camera)                 Your computer                 tablet (student)
    /camera page        <-->       FastAPI server       <-->     main page "/"
    watches the board              runs the AI calls             draws, touches, listens
 ```
@@ -112,7 +112,7 @@ You will see output in the terminal as the app receives actions from the devices
 
 ### Connect your devices over HTTPS
 
-Phone and iPad browsers only allow the camera and microphone on secure (HTTPS) pages. A plain `http://` address on your network will not work. The easiest fix is a tunnel service that gives your local server a secure link, for example:
+Phone and tablet browsers only allow the camera and microphone on secure (HTTPS) pages. A plain `http://` address on your network will not work. The easiest fix is a tunnel service that gives your local server a secure link, for example:
 
 ```bash
 ngrok http 8000
@@ -120,7 +120,7 @@ ngrok http 8000
 
 Use the `https://...` address it prints.
 
-- **iPad:** open that address.
+- **tablet:** open that address.
 - **Phone:** open the same address followed by `/camera`.
 
 ---
@@ -128,7 +128,7 @@ Use the `https://...` address it prints.
 ## How to use it
 
 1. **Phone (Set up by a peer or instructor):** open the `/camera` page, tap anywhere to start the camera, then prop the phone up so it faces the whiteboard. Allow camera access when asked.
-2. **iPad (Operated by the blind student):** Open the main page. A screen reader (like VoiceOver) or a single tap anywhere on the screen will start the app with a spoken welcome.
+2. **tablet (Operated by the blind student):** Open the main page. A screen reader (like VoiceOver) or a single tap anywhere on the screen will start the app with a spoken welcome.
 3. Wait for the instructions while the app reads the equation aloud.
 4. **Write with the stylus.** Listen for guidance to help complete writing if missing or if you drift off track.
 5. **Pause.** The app checks what you wrote and tells you how it looks.
@@ -149,7 +149,7 @@ Use the `https://...` address it prints.
 
 | File | What it does |
 |------|--------------|
-| `big_bang.py` | The server and the web pages for the iPad and phone: scanning, guidance, tutor feedback, voice, live updates |
+| `big_bang.py` | The server and the web pages for the tablet and phone: scanning, guidance, tutor feedback, voice, live updates |
 | `symbol_map.py` | Finds each symbol in the student's writing and names it for touch exploration |
 | `requirements.txt` | Python packages to install |
 | `.env.example` | Template for your API key file |
@@ -160,9 +160,9 @@ Use the `https://...` address it prints.
 
 | Problem | What to try |
 |---------|-------------|
-| "The phone camera is not connected" | Open the `/camera` page on the phone first, then tap the iPad again |
+| "The phone camera is not connected" | Open the `/camera` page on the phone first, then tap the tablet again |
 | Camera or microphone does not start | Make sure you opened the secure `https://` address and allowed access in the browser |
-| No spoken voice | Tap the iPad screen once after loading (browsers block sound until you tap), and check the volume |
+| No spoken voice | Tap the tablet screen once after loading (browsers block sound until you tap), and check the volume |
 | Voice questions are not understood | Check that `ffmpeg -version` works and that your API key is correct |
 | Symbols are not named | Check your API key. Without it, the app falls back to simple shape detection and names are less accurate |
 | Scan does not read the equation | Use good light, hold the phone still, and write the equation large and clear |
@@ -172,7 +172,7 @@ Use the `https://...` address it prints.
 ## Limits to know about
 
 - The app is optimized for visually impaired individuals with prior non-Braille writing experience (e.g., those who recently lost their vision and retain muscle memory for standard handwriting).
-- The app serves **one student at a time**. Two iPads connected to the same server will interfere with each other.
+- The app serves **one student at a time**. Two tablets connected to the same server will interfere with each other.
 - Because the system provides continuous spoken feedback for individual strokes, rapid drawing can cause audio streams to queue up or block one another. This sequential audio processing could be optimized for true real-time speeds in a production deployment by implementing dynamic audio interruption.
 - Speech and AI features **need internet**.
 - Spoken output is **English only**.
