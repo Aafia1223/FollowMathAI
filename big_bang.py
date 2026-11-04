@@ -29,13 +29,18 @@ from PIL import Image, ImageOps
 from gtts import gTTS
 import subprocess
 import tempfile
+import imageio_ffmpeg
 from dotenv import load_dotenv
 from symbol_map import build_symbol_map
 
 load_dotenv()
 META_API_KEY = os.getenv("META_API_KEY")
 META_CHAT_ENDPOINT = "https://api.meta.ai/v1/chat/completions"
-FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")   # set FFMPEG_PATH in .env if ffmpeg is not on PATH
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except (ImportError, RuntimeError):
+    FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
 # --- Shared state ---
 pipeline_data = {
