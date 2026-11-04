@@ -64,7 +64,7 @@ The code that finds and names the symbols the student can touch is in `symbol_ma
 **1. Get the code and install the packages**
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/Aafia1223/FollowMathAI.git
 cd FollowMathAI
 python -m venv venv
 ```
@@ -185,4 +185,4 @@ Use the `https://...` address it prints.
 - [gTTS](https://pypi.org/project/gTTS/) for text-to-speech
 - [FastAPI](https://fastapi.tiangolo.com/), [OpenCV](https://opencv.org/), [Pillow](https://python-pillow.org/) and [httpx](https://www.python-httpx.org/)
 
-Built by **[Aafia Nawal / FollowMathAI]**.
+Built by **Aafia Nawal- FollowMathAI**.
