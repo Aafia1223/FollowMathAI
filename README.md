@@ -173,11 +173,21 @@ Use the `https://...` address it prints.
 
 - The app is optimized for visually impaired individuals with prior non-Braille writing experience (e.g., those who recently lost their vision and retain muscle memory for standard handwriting).
 - The app serves **one student at a time**. Two iPads connected to the same server will interfere with each other.
+- Because the system provides continuous spoken feedback for individual strokes, rapid drawing can cause audio streams to queue up or block one another. This sequential audio processing could be optimized for true real-time speeds in a production deployment by implementing dynamic audio interruption.
 - Speech and AI features **need internet**.
 - Spoken output is **English only**.
 - Pictures of the board and the student's writing are sent to Meta's API to be processed.
 
 ---
+
+## Future Contributions
+
+- **Dynamic Audio:** Upgrading to an interruptible audio queue so rapid stylus strokes instantly cancel older audio, preventing speech lag.
+- **Multi-Student Scaling:** Upgrading the WebSocket backend so multiple students in the same classroom can use one server simultaneously without interference.
+- **Haptic Feedback:** Adding tablet vibrations to provide physical cues when the stylus drifts off track or a finger touches a symbol.
+- **Broader STEM Support:** Expanding the AI pipeline to map spatial chemistry structures, physics vectors, and geometric diagrams.
+- **Direct Digital Imports:** Allowing the system to directly ingest PDFs, LaTeX slides, and digital whiteboards instead of just live camera photos.
+- **Continuous User Research:** Iterating directly with visually impaired students to refine the tactile interface and ensure the system perfectly matches their real-world needs.
 
 ## Credits
 
