@@ -6,3 +6,4 @@ Pillow
 httpx
 gTTS
 python-dotenv
+imageio-ffmpeg
