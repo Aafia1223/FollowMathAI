@@ -1,17 +1,16 @@
 """
 symbol_map.py
 
-Turns a picture of what the student has written into a list of NAMED, touchable symbols.
-Ported from 0_test_sam.py (same SAM 3.1 idea), but async and tuned for the student's own drawing.
+Builds a list of named, touchable symbols from an image of the student's handwriting.
 
 Pipeline:
-  1. SAM 3.1 is asked for each kind of symbol ("equals sign", "digit", "letter", ...); answers are merged.
-  2. An "equals sign" is always ONE item (two stacked bars are merged). A lone bar stays a lone bar.
-  3. Ink that SAM missed is added from the pixels, so no symbol is ever lost.
-  4. Muse Spark looks at each symbol and says what is ACTUALLY drawn (it does not guess what the student
-     meant), so a half-finished "=" is spoken as "a single horizontal line".
+  1. SAM 3.1 is prompted once per symbol type ("equals sign", "digit", ...) and the results are merged.
+  2. An equals sign is always treated as a single item (two stacked bars are merged). A lone bar stays a lone bar.
+  3. Any ink SAM missed is added back from the pixels, so no stroke is dropped.
+  4. Muse Spark names each symbol based on what is actually drawn, not what the student meant to write.
+     A half-finished "=" is therefore read out as "a single horizontal line".
 
-Boxes are returned as FRACTIONS (0-1) of the picture, so the browser can scale them to any canvas size.
+Boxes are returned as fractions (0-1) of the image so the browser can scale them to any canvas size.
 """
 import os
 import re
@@ -30,11 +29,11 @@ load_dotenv()
 
 SAM_ENDPOINT = "https://api.meta.ai/v1/responses"
 CHAT_ENDPOINT = "https://api.meta.ai/v1/chat/completions"
-MAX_SIDE = 1280          # the picture is downscaled to this before going to Meta's models
-SAM_CONCURRENCY = 6
+MAX_SIDE = 1280          # longest image side sent to the models
+SAM_CONCURRENCY = 6      # max parallel requests
 MAX_SYMBOLS = 30
 
-# Most specific first: if two prompts find the same symbol, the earlier one wins and names it.
+# Ordered from most to least specific. When two prompts find the same symbol, the earlier one names it.
 SYMBOL_PROMPTS = [
     "equals sign", "plus sign", "minus sign", "fraction line", "integral sign",
     "parentheses", "digit", "letter", "math symbol", "handwritten character",
@@ -48,8 +47,9 @@ def _key():
     return os.getenv("META_API_KEY")
 
 
-# ----------------------------------------------------------------------------- SAM call
+# ----------------------------------------------------------------------------- SAM requests
 def _collect_texts(obj):
+    # Recursively gather every string in a JSON response
     if isinstance(obj, str):
         return [obj]
     if isinstance(obj, dict):
@@ -90,7 +90,7 @@ async def _call_sam(client, sem, data_url, prompt):
     return boxes
 
 
-# ----------------------------------------------------------------------------- geometry
+# ----------------------------------------------------------------------------- box geometry
 def _area(b):
     return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
 
@@ -106,6 +106,7 @@ def _iou(a, b):
 
 
 def _inside_frac(small, big):
+    # Fraction of `small` that lies inside `big`
     return _inter(small, big) / _area(small) if _area(small) else 0.0
 
 
@@ -113,16 +114,17 @@ def _union(a, b):
     return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
 
 
-# ----------------------------------------------------------------------------- equals sign = ONE item
+# ----------------------------------------------------------------------------- equals sign handling
 def _consolidate_equals(items):
-    # (a) anything mostly inside a SAM "equals sign" box belongs to it (e.g. each bar found as a "minus")
+    # Pass 1: anything mostly inside an "equals sign" box belongs to it
+    # (e.g. each bar detected separately as a "minus sign").
     eq_items = [it for it in items if it["label"] == "equals sign"]
     if eq_items:
         items = [it for it in items
                  if it["label"] == "equals sign"
                  or not any(_inside_frac(it["box"], e["box"]) >= 0.6 for e in eq_items)]
 
-    # (b) safety net: two stacked flat bars of similar width are ONE equals sign
+    # Pass 2: fallback heuristic. Two stacked flat bars of similar width are merged into one equals sign.
     merged = True
     while merged:
         merged = False
@@ -146,8 +148,9 @@ def _consolidate_equals(items):
     return items
 
 
-# ----------------------------------------------------------------------------- ink check (what SAM missed)
+# ----------------------------------------------------------------------------- ink coverage check
 def _ink_components(ink, region):
+    # Connected components of ink inside the region, ignoring tiny specks
     x1, y1, x2, y2 = region
     n, labels, stats, _ = cv2.connectedComponentsWithStats(ink[y1:y2, x1:x2], connectivity=8)
     comps = []
@@ -161,6 +164,7 @@ def _ink_components(ink, region):
 
 
 def _coverage(items, comps, region):
+    # For each ink component, the fraction of its pixels already covered by a detected box
     x1, y1, x2, y2 = region
     covered = np.zeros((y2 - y1, x2 - x1), bool)
     for it in items:
@@ -169,8 +173,9 @@ def _coverage(items, comps, region):
     return [float(covered[c["mask"]].mean()) for c in comps]
 
 
-# ----------------------------------------------------------------------------- naming each symbol (Muse Spark)
+# ----------------------------------------------------------------------------- symbol naming (Muse Spark)
 def _crop_b64(img, box):
+    # Crop one symbol, pad it, upscale small crops, and add a white border for the model
     pad = 8
     W, H = img.size
     crop = img.crop((max(0, box[0] - pad), max(0, box[1] - pad), min(W, box[2] + pad), min(H, box[3] + pad)))
@@ -202,8 +207,8 @@ NAME_PROMPT = (
 
 
 def _name_prompt(hint):
-    # The equation on the board tells us which look-alike letters and digits are likely (y vs a long S, etc.).
-    # It is only a tie-breaker: what is really drawn always wins.
+    # The target equation is only a tie-breaker between look-alike characters (y vs. a long S, etc.).
+    # What is actually drawn always takes priority.
     if not hint:
         return NAME_PROMPT
     return (NAME_PROMPT + f" The student is copying an equation that reads: '{hint}'. Use that ONLY to choose "
@@ -237,7 +242,7 @@ async def _name_one(client, sem, img, item, fallback, hint=""):
 
 
 async def _name_symbols(client, img, items, hint=""):
-    # One small request per symbol, all in parallel: far more reliable than one big multi-image request.
+    # One small request per symbol, run in parallel. This proved more reliable than a single multi-image request.
     names = [_fallback_name(it) for it in items]
     if not items or not _key():
         return names
@@ -245,13 +250,12 @@ async def _name_symbols(client, img, items, hint=""):
     return list(await asyncio.gather(*(_name_one(client, sem, img, it, names[i], hint) for i, it in enumerate(items))))
 
 
-
-# ----------------------------------------------------------------------------- main entry point
+# ----------------------------------------------------------------------------- entry point
 def _prepare_image(image_b64):
     if "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
     img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGBA")
-    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))     # flatten any transparency onto white
+    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))     # flatten transparency onto white
     img = Image.alpha_composite(bg, img).convert("RGB")
     longest = max(img.size)
     if longest > MAX_SIDE:
@@ -273,7 +277,7 @@ async def build_symbol_map(image_b64: str, hint: str = ""):
     ink = (gray < 128).astype(np.uint8) * 255
     ys, xs = np.where(ink > 0)
     if len(xs) < 30:
-        return []                                              # nothing written yet
+        return []                                              # canvas is empty
 
     pad = 6
     region = [max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad),
@@ -287,7 +291,7 @@ async def build_symbol_map(image_b64: str, hint: str = ""):
     data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
     async with httpx.AsyncClient() as client:
-        # 1. SAM, one call per symbol kind (in parallel)
+        # Step 1: SAM, one request per symbol type, in parallel
         if _key():
             sem = asyncio.Semaphore(SAM_CONCURRENCY)
             sam_results = await asyncio.gather(*(_call_sam(client, sem, data_url, p) for p in SYMBOL_PROMPTS))
@@ -305,14 +309,14 @@ async def build_symbol_map(image_b64: str, hint: str = ""):
                 if not (region[0] <= cx <= region[2] and region[1] <= cy <= region[3]):
                     continue
                 if any(_iou(b, it["box"]) > 0.5 or _inside_frac(b, it["box"]) > 0.8 for it in items):
-                    continue                                   # duplicate / part of something already found
+                    continue                                   # duplicate, or part of a symbol already found
                 if sum(1 for c in comps if _inside_frac(c["box"], b) > 0.8) >= 3:
-                    continue                                   # a group box, not a single symbol
+                    continue                                   # box spans a group of symbols, not one
                 items.append({"box": b, "label": "symbol" if prompt in GENERIC_PROMPTS else prompt, "source": "sam"})
 
         items = _consolidate_equals(items)
 
-        # 2. add any ink SAM missed
+        # Step 2: add ink components that SAM missed
         per_comp = _coverage(items, comps, region)
         for c, f in zip(comps, per_comp):
             if f < 0.5:
@@ -322,7 +326,7 @@ async def build_symbol_map(image_b64: str, hint: str = ""):
         items.sort(key=lambda it: ((it["box"][0] + it["box"][2]) / 2, it["box"][1]))
         items = items[:MAX_SYMBOLS]
 
-        # 3. say what each one actually is
+        # Step 3: name each symbol
         names = await _name_symbols(client, img, items, hint)
 
     segments = []
