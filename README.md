@@ -171,7 +171,7 @@ Use the `https://...` address it prints.
 
 ## Limits to know about
 
-- The app serves visually-impaired people who KNOWS how to write in non-braille, for e.g, recent visual impairment.
+- The app is optimized for visually impaired individuals with prior non-Braille writing experience (e.g., those who recently lost their vision and retain muscle memory for standard handwriting).
 - The app serves **one student at a time**. Two iPads connected to the same server will interfere with each other.
 - Speech and AI features **need internet**.
 - Spoken output is **English only**.
