@@ -198,7 +198,7 @@ async def transcribe_audio(audio_b64: str):
         temp_out_path = temp_in_path.replace(".mp4", ".wav")
         
         # Use a raw string (r"") so Windows backslashes don't break the path
-        FFMPEG_PATH = r"C:\Users\Ghulam\Downloads\vastai_voice_system\ffmpeg.exe" 
+        FFMPEG_PATH = "ffmpeg"
         
         # Exact conversion parameters required by Meta API
         subprocess.run([
